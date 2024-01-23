@@ -1,3 +1,5 @@
+import torch
+
 # Function to calculate linear index based on row-major or column-major ordering
 def calculate_linear_index(tensor, idx, order='row'):
     if order not in ['row', 'column']:
