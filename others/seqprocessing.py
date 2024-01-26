@@ -3,7 +3,11 @@ import triton
 import triton.language as tl
 
 @triton.jit
-def process_q_sequences_kernel(Q, output, seq_length, BLOCK_M, num_sequences, **META):
+def process_q_sequences_kernel(Q, output,
+    seq_length,
+    BLOCK_M: tl.constexpr,
+    num_sequences,
+):
     # Compute program ID
     pid = tl.program_id(0)
     seq_idx = pid // seq_length
@@ -15,9 +19,9 @@ def process_q_sequences_kernel(Q, output, seq_length, BLOCK_M, num_sequences, **
     # Boundary check
     if seq_idx < num_sequences and elem_idx < seq_length:
         # Processing logic
-        elem = Q[global_idx]
+        elem = tl.load(Q + global_idx)
         processed_elem = elem * 2
-        output[global_idx] = processed_elem
+        tl.store(output + global_idx, processed_elem)
 
 def process_q_sequences(Q, seq_length, num_sequences):
     BLOCK_M = 1024
@@ -26,7 +30,8 @@ def process_q_sequences(Q, seq_length, num_sequences):
     output = torch.empty_like(Q)
 
     # Grid dimensions
-    grid = lambda META: (triton.cdiv(num_sequences * seq_length, BLOCK_M),)
+    grid = lambda META: (triton.cdiv(num_sequences * seq_length,
+        META['BLOCK_M']),)
 
     # Launch kernel
     process_q_sequences_kernel[grid](Q, output, seq_length, BLOCK_M, num_sequences)
