@@ -3,29 +3,28 @@ import torch
 import triton
 import triton.language as tl
 import sys
+import yaml
 import argparse
 import pytest
 import json
 #use 03-matmul tutorial
-import 
+from gemm_triton_tutorial import matmul
 
 def read_shapes(filename):
     shapes = []
     with open(filename, 'r') as file:
-        for line in file:
-            # Strip whitespace and then take the part after the line number
-            line_content = line.strip().split(')')[0].split('(')[-1]
-            if line_content:  # Check if there is anything to process
-                # Convert the numbers to integers and create a tuple out of them
-                shape = tuple(map(int, line_content.split(',')))
-                shapes.append(shape)
+        matrix_sizes = yaml.safe_load(file)
+        for item in matrix_sizes:
+            M = item['M']
+            N = item['N']
+            K = item['K']
+            shapes.append([M, N, K])
     return shapes
 
 def speedup(filename):
 
     shapes=read_shapes(filename)
     results = []
-    shapes = shapes[0]
     for M, N, K in shapes:
         a = torch.randn((M, K), device='cuda', dtype=torch.float16)
         b = torch.randn((K, N), device='cuda', dtype=torch.float16)
