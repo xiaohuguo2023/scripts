@@ -49,11 +49,11 @@ def run_triton_kernel(P, C, locks, num_sms, k, M, N, stride_cm, stride_cn, BLOCK
     spinning_lock_kernel[grid](
         P, C, locks, num_sms, k, M, N, stride_cm, stride_cn, BLOCK_SIZE_M=BLOCK_SIZE_M, BLOCK_SIZE_N=BLOCK_SIZE_N,)
 
-BLOCK_SIZE_M = 16
-BLOCK_SIZE_N = 16
-M = 64
-N = 64
-k=4
+BLOCK_SIZE_M = 32
+BLOCK_SIZE_N = 32
+M = 128
+N = 128
+k=8
 num_sms = 304
 
 P = torch.zeros((num_sms * BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=torch.float32, device='cuda')
