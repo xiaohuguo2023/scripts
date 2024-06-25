@@ -27,6 +27,7 @@ def spinning_lock_kernel(P, C, locks, num_sms, k, M, N, stride_cm, stride_cn, BL
                 acc += acc1
 
                 next_pid += 1
+              
 
         # Store results using temporary storage P for every k-1 pids
         else:
@@ -49,12 +50,28 @@ def run_triton_kernel(P, C, locks, num_sms, k, M, N, stride_cm, stride_cn, BLOCK
     spinning_lock_kernel[grid](
         P, C, locks, num_sms, k, M, N, stride_cm, stride_cn, BLOCK_SIZE_M=BLOCK_SIZE_M, BLOCK_SIZE_N=BLOCK_SIZE_N,)
 
-BLOCK_SIZE_M = 32
-BLOCK_SIZE_N = 32
-M = 128
-N = 128
-k=8
+BLOCK_SIZE_M = 128
+BLOCK_SIZE_N = 128
+BLOCK_SIZE_K = 64
+M = 1024
+N = 1024
+K = 1024
 num_sms = 304
+total_programs_streamk = num_sms
+total_blocks_M = triton.cdiv(M, BLOCK_SIZE_M)
+total_blocks_N = triton.cdiv(N, BLOCK_SIZE_N)
+iters_per_tile = triton.cdiv(K, BLOCK_SIZE_K)
+total_tiles = total_blocks_M * total_blocks_N
+total_tiles_streamk = total_tiles % total_programs_streamk
+total_blocking_tiles = total_tiles - total_tiles_streamk
+total_streamk_iters = total_tiles_streamk * iters_per_tile
+streamk_iters_pcu = total_streamk_iters // num_sms
+streamk_remainder_iters = total_streamk_iters % num_sms
+print(f"M,N,K={M},{N},{K} ; BLK_M,N,K={BLOCK_SIZE_M},{BLOCK_SIZE_N},{BLOCK_SIZE_K}")
+print(f"{total_blocks_M=} x {total_blocks_N=} = {total_tiles=}")
+print(f"{total_tiles_streamk=} + {total_blocking_tiles=} = {total_tiles=}")
+print(f"{total_streamk_iters=} + {streamk_iters_pcu=} = {streamk_remainder_iters=}")
+k=3
 
 P = torch.zeros((num_sms * BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=torch.float32, device='cuda')
 C = torch.zeros((M, N), dtype=torch.float32, device='cuda')
