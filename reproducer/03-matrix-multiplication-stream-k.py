@@ -21,7 +21,7 @@ import random
 #from triton.runtime.driver import CudaUtils
 import json
 #from persistent_streamk_kernel_l2 import persistent_streamk_gemm
-from persistent_streamk_kernel import persistent_streamk_gemm
+from issue_kernel import streamk_gemm
 
 torch.manual_seed(123)
 random.seed(123)
@@ -30,7 +30,7 @@ random.seed(123)
 #cuda_utils = CudaUtils()
 #total_sm = cuda_utils.get_device_properties(device)["multiprocessor_count"]
 #total_sm = 110 # for MI250
-total_sm = 304
+total_sm = 414
 print(f"total SMs: {total_sm}")
 
 class matmul(torch.autograd.Function):
@@ -93,7 +93,7 @@ class matmul(torch.autograd.Function):
         stride_bias = bias.stride(0) if use_bias else 0
       #  P=P*0.0
       #  locks=locks*0
-        kk = persistent_streamk_gemm[(grids,)](
+        kk = streamk_gemm[(grids,)](
             a,
             b,
             c,
@@ -147,9 +147,12 @@ perf = lambda ms: 2 * m * n * k * 1e-12 / (ms * 1e-3)
 #m, n, k = 8133, 8132, 8172  # some problem size to test
 #m, n, k = 8192, 8192, 8192  # some problem size to test
 #m, n, k = 8128, 6878, 7378  # some problem size to test
-m, n, k = 8192, 4864, 6878  # some problem size to test
+#m, n, k = 8192, 4864, 6878  # some problem size to test
 #m, n, k = 512, 512, 512  # some problem size to test
 #m, n, k = 6912, 768, 256  # some problem size to test
+#m, n, k =4864, 8192, 4160  # some problem size to test
+#m, n, k = 5632, 6656, 7936
+m, n, k =1024, 3072, 2048
 
 A = torch.randn(m, k, device="cuda", dtype=torch.float16)
 B = torch.randn(n, k, device="cuda", dtype=torch.float16).T
@@ -157,8 +160,8 @@ B = torch.randn(n, k, device="cuda", dtype=torch.float16).T
 C = torch.zeros((m, n), device="cuda", dtype=A.dtype)
 bias = torch.zeros((m,), device="cuda", dtype=A.dtype)
 #bias = None
-BLK_M = 128
-BLK_N = 256
+BLK_M = 64
+BLK_N = 64
 BLK_K = 64
 total_blocks_M = triton.cdiv(m, BLK_M)
 total_blocks_N = triton.cdiv(n, BLK_N)
@@ -196,7 +199,7 @@ C = matmul.apply(A, B, C, bias, P, locks, total_sm, BLK_M, BLK_N, BLK_K, gsize_m
 matmul.set_debug(False)
 expected = A @ B
 
-assert torch.allclose(C, expected, atol=1), f"max: {(C - expected).abs().max().item()}\n{C}\n{expected}"
+assert torch.allclose(C, expected, atol=5e-1), f"max: {(C - expected).abs().max().item()}\n{C}\n{expected}"
 print("pass validation test")
 
 # for debugging, uncomment the following line
@@ -259,9 +262,12 @@ for idx, (m, n, k) in enumerate(shapes):
             nb_sm.append(total_tile)
         nb_sm += random.sample(range(2, total_sm * 2, 2), 10)
         for sm in nb_sm:
-            triton_ms = triton.testing.do_bench(lambda: matmul.apply(A, B, output, sm, BLK_M, BLK_N, BLK_K, gsize_m, two_tiles, num_stages, num_warps, waves_per_eu,  mfmaInstrSize, kpack))
+            locks = torch.zeros((total_sm*2,), device = "cuda", dtype = torch.int32)
+            P = torch.zeros((total_sm*2,  BLK_M*BLK_N), device="cuda", dtype=torch.float32)
+            bias = torch.zeros((m,), device="cuda", dtype=A.dtype)
+            triton_ms = triton.testing.do_bench(lambda: matmul.apply(A, B, output, bias, P, locks, sm, BLK_M, BLK_N, BLK_K, gsize_m, two_tiles, num_stages, num_warps, waves_per_eu,  mfmaInstrSize, kpack))
             C = torch.zeros((m, n), device="cuda", dtype=A.dtype)
-            C = matmul.apply(A, B, C, total_sm, BLK_M, BLK_N, BLK_K, gsize_m, two_tiles, num_stages, num_warps, waves_per_eu,  mfmaInstrSize, kpack)
+            C = matmul.apply(A, B, C, bias, P, locks, total_sm, BLK_M, BLK_N, BLK_K, gsize_m, two_tiles, num_stages, num_warps, waves_per_eu,  mfmaInstrSize, kpack)
             max_disc = (C - expected).abs().max().item()
             # large tolerance to accomodate for large K (rounding due to half precision), we just want to catch bugs.
             assert max_disc <= 5., f"pb size: {m}x{n}x{k} - max discrepancy: {max_disc} - sm: {sm}, 2 tiles: {two_tiles}\n{output}\n{expected}"
