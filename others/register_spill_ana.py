@@ -1,184 +1,108 @@
 import re
 import networkx as nx
 import matplotlib.pyplot as plt
-from collections import defaultdict
+import mplcursors
 
-def parse_register_usage(assembly_file):
-    # Regular expressions for VGPR, SGPR detection, and spill operations
-    vgpr_single_pattern = re.compile(r'v(\d+)')  # Matches individual VGPRs
-    vgpr_range_pattern = re.compile(r'v\[(\d+):(\d+)\]')  # Matches VGPR ranges
-    sgpr_single_pattern = re.compile(r's(\d+)')  # Matches individual SGPRs
-    spill_pattern = re.compile(r'scratch_store_dwordx(\d+)|scratch_store_dword')  # Detect scratch store spills
-    
-    block_registers = defaultdict(lambda: {'vgprs': set(), 'sgprs': set(), 'vgpr_spills': 0})
-    current_block = None
+def extract_execution_sequence(assembly_file):
+    # Initialize directed graph and block metadata
+    control_flow_graph = nx.DiGraph()
+    block_metadata = {}
 
-    with open(assembly_file, 'r') as file:
-        for line in file:
-            line = line.strip()
-
-            # Detect block labels (e.g., .LBB0_1:, .Ltmp0:, ; %bb.0:)
-            label_match = re.match(r'^(\.\w+|; %bb\.\d+):', line)
-            if label_match:
-                current_block = label_match.group(1)
-                continue
-            
-            # If we're in a block, find VGPR and SGPR usage
-            if current_block:
-                # Find individual VGPRs
-                vgprs = vgpr_single_pattern.findall(line)
-                for vgpr in vgprs:
-                    block_registers[current_block]['vgprs'].add(int(vgpr))
-
-                # Find VGPR ranges
-                vgpr_ranges = vgpr_range_pattern.findall(line)
-                for vgpr_range in vgpr_ranges:
-                    start, end = int(vgpr_range[0]), int(vgpr_range[1])
-                    block_registers[current_block]['vgprs'].update(range(start, end + 1))
-
-                # Find individual SGPRs
-                sgprs = sgpr_single_pattern.findall(line)
-                for sgpr in sgprs:
-                    block_registers[current_block]['sgprs'].add(int(sgpr))
-
-                # Check for spill operations (scratch_store_dword) and count them
-                spill_match = spill_pattern.search(line)
-                if spill_match:
-                    if 'x' in line:  # If it's a dwordxN spill
-                        spill_size = int(spill_match.group(1))
-                    else:  # If it's a single dword spill
-                        spill_size = 1
-
-                    # Count VGPRs spilled (check for ranges or single VGPRs)
-                    vgpr_spilled = vgpr_single_pattern.findall(line)  # Find individual VGPRs spilled
-                    vgpr_spilled_ranges = vgpr_range_pattern.findall(line)  # Find VGPR ranges spilled
-
-                    # Add spills for individual VGPRs
-                    block_registers[current_block]['vgpr_spills'] += len(vgpr_spilled) * spill_size
-
-                    # Add spills for VGPR ranges
-                    for vgpr_range in vgpr_spilled_ranges:
-                        start, end = int(vgpr_range[0]), int(vgpr_range[1])
-                        block_registers[current_block]['vgpr_spills'] += (end - start + 1) * spill_size
-
-    return block_registers
-
-
-def aggregate_register_usage(call_tree, block_registers):
-    # Function to aggregate register usage for each block and its dependencies
-    total_register_usage = {}
-
-    def dfs(block, visited):
-        if block in visited:
-            return total_register_usage.get(block, {'vgprs': set(), 'sgprs': set(), 'vgpr_spills': 0})
-
-        visited.add(block)
-        vgprs = block_registers[block]['vgprs'].copy()
-        sgprs = block_registers[block]['sgprs'].copy()
-        vgpr_spills = block_registers[block]['vgpr_spills']
-
-        # Traverse the dependencies (successors) and accumulate register usage
-        for successor in call_tree.successors(block):
-            usage = dfs(successor, visited)
-            vgprs.update(usage['vgprs'])
-            sgprs.update(usage['sgprs'])
-            vgpr_spills += usage['vgpr_spills']
-
-        total_register_usage[block] = {'vgprs': vgprs, 'sgprs': sgprs, 'vgpr_spills': vgpr_spills}
-        return total_register_usage[block]
-
-    # Perform a DFS for each node in the graph to aggregate register usage
-    for block in call_tree.nodes():
-        if block not in total_register_usage:
-            dfs(block, set())
-
-    return total_register_usage
-
-
-def generate_call_tree_and_register_usage(assembly_file):
-    # Initialize directed graph
-    call_tree = nx.DiGraph()
-
-    # Regex patterns to capture labels and jump/branch instructions
+    # Regex patterns to capture labels, branch instructions, and source info
     label_pattern = re.compile(r'^(\.\w+|; %bb\.\d+):')
     jump_pattern = re.compile(r'(s_cbranch|s_branch)\s+(\.\w+|; %bb\.\d+)')
+    source_info_pattern = re.compile(r'\.loc\s+(\d+)\s+(\d+)\s+(\d+)')
 
-    # Initialize variables to store current block
     current_label = None
-    end_program = False  # Flag to stop processing after s_endpgm
+    execution_order = []
+    reached_end = False  # Flag to stop processing after s_endpgm
 
-    # Read the assembly file and build the call tree
+    # Read the assembly file
     with open(assembly_file, 'r') as file:
         for line in file:
             line = line.strip()
 
-            # Stop processing after encountering s_endpgm
+            # Stop processing once s_endpgm is encountered
             if 's_endpgm' in line:
-                end_program = True
+                reached_end = True
                 break
 
-            # Check for labels (blocks like .Ltmp, .LBB, and %bb)
-            label_match = label_pattern.match(line)
-            if not end_program and label_match:
-                current_label = label_match.group(1)
-                call_tree.add_node(current_label)
+            # Skip processing if we've reached the end of relevant code
+            if reached_end:
                 continue
-            
-            # Check for jump/branch instructions
+
+            # Identify labels (basic blocks like .LBB, .Ltmp, or %bb)
+            label_match = label_pattern.match(line)
+            if label_match:
+                current_label = label_match.group(1)
+                control_flow_graph.add_node(current_label)
+                execution_order.append(current_label)
+                continue
+
+            # Identify source locations and add them to the current block's metadata
+            source_match = source_info_pattern.search(line)
+            if source_match and current_label:
+                file_num, line_num, _ = source_match.groups()
+                if current_label not in block_metadata:
+                    block_metadata[current_label] = []
+                block_metadata[current_label].append(f"Source File {file_num}, Line {line_num}")
+
+            # Identify branch/jump instructions and connect blocks
             jump_match = jump_pattern.search(line)
-            if not end_program and jump_match:
+            if jump_match and current_label:
                 target_label = jump_match.group(2)
-                call_tree.add_edge(current_label, target_label)
+                control_flow_graph.add_edge(current_label, target_label)
 
-    # Parse the register usage information for each block
-    block_registers = parse_register_usage(assembly_file)
+    return control_flow_graph, execution_order, block_metadata
 
-    # Aggregate register usage by traversing the call dependencies
-    total_register_usage = aggregate_register_usage(call_tree, block_registers)
+def plot_execution_sequence(control_flow_graph, execution_order, block_metadata):
+    # Create a figure with two subplots: one for the graph and one for the legend
+    fig, (ax1, ax2) = plt.subplots(1, 2, gridspec_kw={'width_ratios': [2, 1]}, figsize=(14, 8))
 
-    # Assign subsets (layers) for the hierarchical layout
-    for node in call_tree.nodes():
-        if node.startswith('.LBB'):
-            call_tree.nodes[node]['subset'] = 1
-        elif node.startswith('.Ltmp'):
-            call_tree.nodes[node]['subset'] = 2
-        elif node.startswith('; %bb'):
-            call_tree.nodes[node]['subset'] = 0
-        else:
-            call_tree.nodes[node]['subset'] = 3
+    # Plot the control flow graph on the left
+    pos = nx.spring_layout(control_flow_graph, k=3, iterations=150, seed=42)
+    nodes = nx.draw(control_flow_graph, pos, ax=ax1, with_labels=False, node_color='skyblue', node_size=1500, arrows=True)
+    node_labels = {node: str(i+1) for i, node in enumerate(execution_order)}
+    nx.draw_networkx_labels(control_flow_graph, pos, labels=node_labels, font_size=10, font_weight='bold', ax=ax1)
 
-    # Generate a hierarchical tree layout from top to bottom
-    pos = nx.multipartite_layout(call_tree, subset_key="subset")
+    # Create a list of blocks with their corresponding numbers
+    numbered_blocks = [f"{i+1}: {block}" for i, block in enumerate(execution_order)]
 
-    # Plot the call tree with register usage information
-    plt.figure(figsize=(12, 10))
+    # Display the block name list in the second subplot (right-hand side)
+    ax2.text(0.05, 1, '\n'.join(numbered_blocks), fontsize=12, va='top', ha='left', bbox=dict(facecolor='white', alpha=0.8))
 
-    # Draw nodes with colors for .LBB, .Ltmp, and %bb nodes
-    lbb_nodes = [n for n in call_tree if n.startswith('.LBB')]
-    ltmp_nodes = [n for n in call_tree if n.startswith('.Ltmp')]
-    bb_nodes = [n for n in call_tree if n.startswith('; %bb')]
-    other_nodes = [n for n in call_tree if n not in lbb_nodes and n not in ltmp_nodes and n not in bb_nodes]
+    # Remove axis from the legend area and draw a box around it
+    ax2.axis('off')
+    for spine in ax2.spines.values():
+        spine.set_edgecolor('black')
+        spine.set_linewidth(2)
 
-    nx.draw_networkx_nodes(call_tree, pos, nodelist=lbb_nodes, node_color='skyblue', node_size=2000, label='.LBB Nodes')
-    nx.draw_networkx_nodes(call_tree, pos, nodelist=ltmp_nodes, node_color='lightgreen', node_size=1500, label='.Ltmp Nodes')
-    nx.draw_networkx_nodes(call_tree, pos, nodelist=bb_nodes, node_color='pink', node_size=1500, label='; %bb Nodes')
-    nx.draw_networkx_nodes(call_tree, pos, nodelist=other_nodes, node_color='orange', node_size=1500, label='Other Nodes')
+    # Draw a box around the graph
+    for spine in ax1.spines.values():
+        spine.set_edgecolor('black')
+        spine.set_linewidth(2)
 
-    # Draw edges
-    nx.draw_networkx_edges(call_tree, pos, arrows=True)
+    # Adjust layout and title
+    plt.subplots_adjust(wspace=0.3)
+    fig.suptitle("Execution Sequence of Assembly Code Blocks (Numbered Nodes)", fontsize=16)
 
-    # Add labels with total register usage and spills
-    labels = {
-        node: f"{node}\nVGPRs: {len(total_register_usage[node]['vgprs'])}, SGPRs: {len(total_register_usage[node]['sgprs'])}, Spills: {total_register_usage[node]['vgpr_spills']}"
-        for node in call_tree.nodes()
-    }
-    nx.draw_networkx_labels(call_tree, pos, labels, font_size=8, font_weight='bold')
+    # Enable hover functionality with mplcursors
+    cursor = mplcursors.cursor(nodes, hover=True)
 
-    plt.legend()
-    plt.title("Call Tree and Register Usage (Including Spills) for AMDGCN Assembly Blocks")
+    # Display tooltips on hover with the source file and line numbers (multiple sources per block)
+    @cursor.connect("add")
+    def on_add(sel):
+        node_index = int(sel.target.index)
+        block_name = execution_order[node_index]
+        source_info = block_metadata.get(block_name, ['No Source Info'])
+        sel.annotation.set_text(f"Block {node_labels[block_name]}\n" + "\n".join(source_info))
+
     plt.show()
 
+# Load the assembly file and extract control flow graph and execution sequence
+assembly_file = 'streamk_gemm.amdgcn'  # Replace with your actual assembly file path
+control_flow_graph, execution_order, block_metadata = extract_execution_sequence(assembly_file)
 
-# Call this function with the path to your assembly file
-generate_call_tree_and_register_usage('streamk_gemm.amdgcn')
+# Plot the control flow and execution sequence
+plot_execution_sequence(control_flow_graph, execution_order, block_metadata)
 
