@@ -10,16 +10,18 @@ vgpr_range_pattern = re.compile(r'v\[(\d+):(\d+)\]')                 # Matches V
 sgpr_single_pattern = re.compile(r'(?<!\[)s(\d+)(?![\d:])')          # Matches individual SGPRs not in ranges
 sgpr_range_pattern = re.compile(r's\[(\d+):(\d+)\]')                 # Matches SGPR ranges
 
+# Patterns to detect specific instruction types
 spill_pattern = re.compile(r'^scratch_store_dwordx?\d*')  # Detect scratch store spills
 reload_pattern = re.compile(r'^scratch_load_dwordx?\d*')  # Detect scratch load reloads
+global_load_pattern = re.compile(r'^global_load_.*')
+global_store_pattern = re.compile(r'^global_store_.*')
+v_mfma_pattern = re.compile(r'^v_mfma_.*')
 
 def parse_register_usage(lines):
     block_registers = defaultdict(lambda: {
         'vgprs': set(),
         'sgprs': set(),
-        'spilled_vgprs': set(),
-        'reloaded_vgprs': set(),
-        'vgpr_spills': 0,
+        'vgpr_instruction_types': defaultdict(set),  # key: vgpr number, value: set of instruction types
     })
     current_block = None
 
@@ -34,36 +36,37 @@ def parse_register_usage(lines):
 
         # If we're in a block, find VGPR and SGPR usage
         if current_block:
-            # Check for spill instructions
-            if spill_pattern.match(line):
-                vgprs_spilled = extract_vgprs_from_instruction(line)
-                block_registers[current_block]['spilled_vgprs'].update(vgprs_spilled)
-                block_registers[current_block]['vgpr_spills'] += len(vgprs_spilled)
-                # Also add to vgprs
-                block_registers[current_block]['vgprs'].update(vgprs_spilled)
-                continue  # Skip to next line
+            # Split the line on ';' to remove comments
+            code = line.split(';')[0].strip()
+            if not code:
+                continue  # Empty or comment line
 
-            # Check for reload instructions
-            if reload_pattern.match(line):
-                vgprs_reloaded = extract_vgprs_from_instruction(line)
-                block_registers[current_block]['reloaded_vgprs'].update(vgprs_reloaded)
-                # Also add to vgprs
-                block_registers[current_block]['vgprs'].update(vgprs_reloaded)
-                continue  # Skip to next line
+            tokens = code.split()
+            if not tokens:
+                continue  # No instruction
 
-            # Find VGPR ranges
-            vgpr_ranges = vgpr_range_pattern.findall(line)
-            for vgpr_range in vgpr_ranges:
-                start, end = int(vgpr_range[0]), int(vgpr_range[1])
-                block_registers[current_block]['vgprs'].update(range(start, end + 1))
+            instruction = tokens[0]
 
-            # Remove VGPR ranges from the line to prevent matching numbers within ranges
-            line_no_vgpr_ranges = vgpr_range_pattern.sub('', line)
+            # Determine instruction type
+            if spill_pattern.match(instruction):
+                instruction_type = 'scratch_store'
+            elif reload_pattern.match(instruction):
+                instruction_type = 'scratch_load'
+            elif v_mfma_pattern.match(instruction):
+                instruction_type = 'v_mfma'
+            elif global_load_pattern.match(instruction):
+                instruction_type = 'global_load'
+            elif global_store_pattern.match(instruction):
+                instruction_type = 'global_store'
+            else:
+                instruction_type = 'others'
 
-            # Find individual VGPRs
-            vgprs = vgpr_single_pattern.findall(line_no_vgpr_ranges)
-            for vgpr in vgprs:
-                block_registers[current_block]['vgprs'].add(int(vgpr))
+            # Extract VGPRs used in the instruction
+            vgprs_used = extract_vgprs_from_instruction(line)
+            # Add VGPRs to the block's vgprs set and instruction types
+            for vgpr in vgprs_used:
+                block_registers[current_block]['vgprs'].add(vgpr)
+                block_registers[current_block]['vgpr_instruction_types'][vgpr].add(instruction_type)
 
             # Find SGPR ranges
             sgpr_ranges = sgpr_range_pattern.findall(line)
@@ -182,9 +185,9 @@ def generate_call_tree_and_register_usage(assembly_file):
     # Draw edges
     nx.draw_networkx_edges(call_tree, pos, arrows=True)
 
-    # Add labels with per-block register usage and spills
+    # Add labels with per-block register usage
     labels = {
-        node: f"{node}\nVGPRs: {len(block_registers[node]['vgprs'])}, SGPRs: {len(block_registers[node]['sgprs'])}, Spills: {block_registers[node]['vgpr_spills']}"
+        node: f"{node}\nVGPRs: {len(block_registers[node]['vgprs'])}, SGPRs: {len(block_registers[node]['sgprs'])}"
         for node in call_tree.nodes()
     }
     nx.draw_networkx_labels(call_tree, pos, labels, font_size=8, font_weight='bold')
@@ -198,10 +201,10 @@ def generate_call_tree_and_register_usage(assembly_file):
     for block, usage in block_registers.items():
         print(f"Block {block}:")
         print(f"  VGPRs: {sorted(usage['vgprs'])}")
-        print(f"  Spilled VGPRs: {sorted(usage['spilled_vgprs'])}")
-        print(f"  Reloaded VGPRs: {sorted(usage['reloaded_vgprs'])}")
         print(f"  SGPRs: {sorted(usage['sgprs'])}")
-        print(f"  Spills: {usage['vgpr_spills']}")
+        print(f"  VGPR Instruction Types:")
+        for vgpr, types in usage['vgpr_instruction_types'].items():
+            print(f"    v{vgpr}: {', '.join(types)}")
 
     # Determine the calling sequence
     blocks_in_call_sequence = get_calling_sequence(call_tree)
@@ -240,6 +243,19 @@ def plot_vgpr_usage(block_registers, blocks_in_call_sequence):
     blocks = blocks_in_call_sequence
     block_indices = {block: idx for idx, block in enumerate(blocks)}
 
+    # Define colors for instruction types with priority
+    instruction_colors = {
+        'scratch_store': 'red',
+        'scratch_load': 'green',
+        'v_mfma': 'orange',
+        'global_store': 'purple',
+        'global_load': 'cyan',
+        'others': 'blue',
+    }
+
+    # Define priority for instruction types
+    instruction_priority = ['scratch_store', 'scratch_load', 'v_mfma', 'global_store', 'global_load', 'others']
+
     # Prepare data for plotting
     x_vals = []
     y_vals = []
@@ -251,12 +267,14 @@ def plot_vgpr_usage(block_registers, blocks_in_call_sequence):
         for vgpr in vgprs:
             x_vals.append(idx)
             y_vals.append(vgpr)
-            if vgpr in block_registers[block]['spilled_vgprs']:
-                colors.append('red')       # Spilled VGPRs
-            elif vgpr in block_registers[block]['reloaded_vgprs']:
-                colors.append('green')     # Reloaded VGPRs
-            else:
-                colors.append('blue')      # Normal VGPR usage
+            instruction_types = block_registers[block]['vgpr_instruction_types'][vgpr]
+            # Determine color based on highest priority instruction type
+            color = 'blue'  # Default color
+            for instr_type in instruction_priority:
+                if instr_type in instruction_types:
+                    color = instruction_colors[instr_type]
+                    break
+            colors.append(color)
 
     # Plotting
     plt.figure(figsize=(12, 6))
@@ -265,20 +283,20 @@ def plot_vgpr_usage(block_registers, blocks_in_call_sequence):
     plt.ylabel('VGPR Register Index')
     plt.title('VGPR Usage per Block (Ordered by Calling Sequence)')
     plt.xticks(range(len(blocks)), blocks, rotation=90)
-    plt.yticks(range(0, 256, 8))  # Adjust the step as needed
+    plt.yticks(range(0, max(y_vals)+1, 8))  # Adjust the step as needed
     plt.grid(True)
     plt.tight_layout()
 
     # Add a legend
     import matplotlib.patches as mpatches
-    blue_patch = mpatches.Patch(color='blue', label='Normal VGPR Usage')
-    red_patch = mpatches.Patch(color='red', label='Spilled VGPR')
-    green_patch = mpatches.Patch(color='green', label='Reloaded VGPR')
-    plt.legend(handles=[blue_patch, red_patch, green_patch])
+    legend_patches = [mpatches.Patch(color=color, label=instr_type.replace('_', ' ').title())
+                      for instr_type, color in instruction_colors.items()]
+    plt.legend(handles=legend_patches)
 
     plt.show()
 
 # Call this function with the path to your assembly file
 #generate_call_tree_and_register_usage('streamk_gemm.amdgcn')
-generate_call_tree_and_register_usage('matmul_kernel_BM256_BN256_BK64_GM1_SK1_nW8_nS2_EU0_kP2_mfma16.amdgcn')
+generate_call_tree_and_register_usage('streamk_gemm_maskstore.amdgcn')
+#generate_call_tree_and_register_usage('matmul_kernel_BM256_BN256_BK64_GM1_SK1_nW8_nS2_EU0_kP2_mfma16.amdgcn')
 
